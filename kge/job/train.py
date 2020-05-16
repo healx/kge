@@ -1,8 +1,6 @@
-import itertools
 import os
 import math
 import time
-import sys
 from collections import defaultdict
 
 from dataclasses import dataclass
@@ -16,7 +14,7 @@ from kge.job import Job
 from kge.model import KgeModel
 
 from kge.util import KgeLoss, KgeOptimizer, KgeSampler, KgeLRScheduler
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional
 import kge.job.util
 
 SLOTS = [0, 1, 2]
@@ -52,7 +50,12 @@ class TrainingJob(Job):
     """
 
     def __init__(
-        self, config: Config, dataset: Dataset, parent_job: Job = None, model=None
+        self,
+        config: Config,
+        dataset: Dataset,
+        parent_job: Job = None,
+        initialize_for_forward_only=False,
+        model=None,
     ) -> None:
         from kge.job import EvaluationJob
 
@@ -61,8 +64,6 @@ class TrainingJob(Job):
             self.model: KgeModel = KgeModel.create(config, dataset)
         else:
             self.model: KgeModel = model
-        self.optimizer = KgeOptimizer.create(config, self.model)
-        self.kge_lr_scheduler = KgeLRScheduler(config, self.optimizer)
         self.loss = KgeLoss.create(config)
         self.abort_on_nan: bool = config.get("train.abort_on_nan")
         self.batch_size: int = config.get("train.batch_size")
@@ -72,16 +73,25 @@ class TrainingJob(Job):
         self.config.check("train.trace_level", ["batch", "epoch"])
         self.trace_batch: bool = self.config.get("train.trace_level") == "batch"
         self.epoch: int = 0
-        self.valid_trace: List[Dict[str, Any]] = []
-        valid_conf = config.clone()
-        valid_conf.set("job.type", "eval")
-        if self.config.get("valid.split") != "":
-            valid_conf.set("eval.split", self.config.get("valid.split"))
-        valid_conf.set("eval.trace_level", self.config.get("valid.trace_level"))
-        self.valid_job = EvaluationJob.create(
-            valid_conf, dataset, parent_job=self, model=self.model
-        )
         self.is_prepared = False
+        self.is_forward_only = initialize_for_forward_only
+
+        if not initialize_for_forward_only:
+
+            self.model.train()
+
+            self.optimizer = KgeOptimizer.create(config, self.model)
+            self.kge_lr_scheduler = KgeLRScheduler(config, self.optimizer)
+
+            valid_conf = config.clone()
+            valid_conf.set("job.type", "eval")
+            if self.config.get("valid.split") != "":
+                valid_conf.set("eval.split", self.config.get("valid.split"))
+            valid_conf.set("eval.trace_level", self.config.get("valid.trace_level"))
+            self.valid_job = EvaluationJob.create(
+                valid_conf, dataset, parent_job=self, model=self.model
+            )
+            self.valid_trace: List[Dict[str, Any]] = []
 
         # attributes filled in by implementing classes
         self.loader = None
@@ -116,25 +126,38 @@ class TrainingJob(Job):
             for f in Job.job_created_hooks:
                 f(self)
 
-        self.model.train()
-
     @staticmethod
     def create(
-        config: Config, dataset: Dataset, parent_job: Job = None, model=None
+        config: Config,
+        dataset: Dataset,
+        parent_job: Job = None,
+        initialize_for_forward_only=False,
+        model=None,
     ) -> "TrainingJob":
         """Factory method to create a training job."""
         if config.get("train.type") == "KvsAll":
-            return TrainingJobKvsAll(config, dataset, parent_job, model=model)
+            return TrainingJobKvsAll(
+                config, dataset, parent_job, initialize_for_forward_only, model,
+            )
         elif config.get("train.type") == "negative_sampling":
-            return TrainingJobNegativeSampling(config, dataset, parent_job, model=model)
+            return TrainingJobNegativeSampling(
+                config, dataset, parent_job, initialize_for_forward_only, model,
+            )
         elif config.get("train.type") == "1vsAll":
-            return TrainingJob1vsAll(config, dataset, parent_job, model=model)
+            return TrainingJob1vsAll(
+                config, dataset, parent_job, initialize_for_forward_only, model,
+            )
         else:
             # perhaps TODO: try class with specified name -> extensibility
             raise ValueError("train.type")
 
     def run(self) -> None:
         """Start/resume the training job and run to completion."""
+        if self.is_forward_only:
+            raise Exception(
+                f"{self.__class__.__name__} was initialized for forward only. You can only call run_epoch()"
+            )
+
         self.config.log("Starting training...")
         checkpoint_every = self.config.get("train.checkpoint.every")
         checkpoint_keep = self.config.get("train.checkpoint.keep")
@@ -317,7 +340,8 @@ class TrainingJob(Job):
                 f(self)
 
             # process batch (preprocessing + forward pass + backward pass on loss)
-            self.optimizer.zero_grad()
+            if not self.is_forward_only:
+                self.optimizer.zero_grad()
             batch_result: TrainingJob._ProcessBatchResult = self._process_batch(
                 batch_index, batch
             )
@@ -337,7 +361,8 @@ class TrainingJob(Job):
             batch_backward_time = batch_result.backward_time - time.time()
             penalty = 0.0
             for index, (penalty_key, penalty_value_torch) in enumerate(penalties_torch):
-                penalty_value_torch.backward()
+                if not self.is_forward_only:
+                    penalty_value_torch.backward()
                 penalty += penalty_value_torch.item()
                 sum_penalties[penalty_key] += penalty_value_torch.item()
             sum_penalty += penalty
@@ -377,9 +402,11 @@ class TrainingJob(Job):
                     )
 
             # update parameters
-            batch_optimizer_time = -time.time()
-            self.optimizer.step()
-            batch_optimizer_time += time.time()
+            batch_optimizer_time = 0
+            if not self.is_forward_only:
+                batch_optimizer_time = -time.time()
+                self.optimizer.step()
+                batch_optimizer_time += time.time()
 
             # tracing/logging
             if self.trace_batch:
@@ -448,7 +475,6 @@ class TrainingJob(Job):
             split=self.train_split,
             batches=len(self.loader),
             size=self.num_examples,
-            lr=[group["lr"] for group in self.optimizer.param_groups],
             avg_loss=sum_loss / self.num_examples,
             avg_penalty=sum_penalty / len(self.loader),
             avg_penalties={k: p / len(self.loader) for k, p in sum_penalties.items()},
@@ -461,6 +487,10 @@ class TrainingJob(Job):
             other_time=other_time,
             event="epoch_completed",
         )
+        if not self.is_forward_only:
+            trace_entry.update(
+                lr=[group["lr"] for group in self.optimizer.param_groups],
+            )
         for f in self.post_epoch_trace_hooks:
             f(self, trace_entry)
         trace_entry = self.trace(**trace_entry, echo=True, echo_prefix="  ", log=True)
@@ -506,8 +536,17 @@ class TrainingJobKvsAll(TrainingJob):
     - Example: a query + its labels, e.g., (John,marriedTo), [Jane]
     """
 
-    def __init__(self, config, dataset, parent_job=None, model=None):
-        super().__init__(config, dataset, parent_job, model=model)
+    def __init__(
+        self,
+        config,
+        dataset,
+        parent_job=None,
+        initialize_for_forward_only=False,
+        model=None,
+    ):
+        super().__init__(
+            config, dataset, parent_job, initialize_for_forward_only, model
+        )
         self.label_smoothing = config.check_range(
             "KvsAll.label_smoothing", float("-inf"), 1.0, max_inclusive=False
         )
@@ -543,6 +582,15 @@ class TrainingJobKvsAll(TrainingJob):
                     )
                 )
 
+        self.label_splits = set(self.config.get("KvsAll.label_splits")) | set(
+            [self.train_split]
+        )
+
+        self.queries = None
+        self.labels = None
+        self.label_offsets = None
+        self.query_end_index = None
+
         config.log("Initializing 1-to-N training job...")
         self.type_str = "KvsAll"
 
@@ -573,7 +621,7 @@ class TrainingJobKvsAll(TrainingJob):
 
         #' for each query type (ordered as in self.query_types), index right after last
         #' example of that type in the list of all examples
-        self.query_end_index = []
+        self.query_end_index = {}
 
         # construct relevant data structures
         self.num_examples = 0
@@ -583,9 +631,12 @@ class TrainingJobKvsAll(TrainingJob):
                 if query_type == "sp_"
                 else ("so_to_p" if query_type == "s_o" else "po_to_s")
             )
-            index = self.dataset.index(f"{self.train_split}_{index_type}")
+            split_combi_str = "_".join(sorted(self.label_splits))
+            label_index = self.dataset.index(f"{split_combi_str}_{index_type}")
+            query_index = self.dataset.index(f"{self.train_split}_{index_type}")
+            index = {k: v for k, v in label_index.items() if k in query_index}
             self.num_examples += len(index)
-            self.query_end_index.append(self.num_examples)
+            self.query_end_index[query_type] = self.num_examples
 
             # Convert indexes to pytorch tensors (as described above).
             (
@@ -623,8 +674,8 @@ class TrainingJobKvsAll(TrainingJob):
             num_ones = 0
             for example_index in batch:
                 start = 0
-                for query_type_index, query_type in enumerate(self.query_types):
-                    end = self.query_end_index[query_type_index]
+                for query_type in self.query_types:
+                    end = self.query_end_index[query_type]
                     if example_index < end:
                         example_index -= start
                         num_ones += self.label_offsets[query_type][example_index + 1]
@@ -641,7 +692,7 @@ class TrainingJobKvsAll(TrainingJob):
             for batch_index, example_index in enumerate(batch):
                 start = 0
                 for query_type_index, query_type in enumerate(self.query_types):
-                    end = self.query_end_index[query_type_index]
+                    end = self.query_end_index[query_type]
                     if example_index < end:
                         example_index -= start
                         query_type_indexes_batch[batch_index] = query_type_index
@@ -759,7 +810,8 @@ class TrainingJobKvsAll(TrainingJob):
                 loss_value_total = loss_value.item()
                 forward_time += time.time()
                 backward_time -= time.time()
-                loss_value.backward()
+                if not self.is_forward_only:
+                    loss_value.backward()
                 backward_time += time.time()
 
         # all done
@@ -769,10 +821,18 @@ class TrainingJobKvsAll(TrainingJob):
 
 
 class TrainingJobNegativeSampling(TrainingJob):
-    def __init__(self, config, dataset, parent_job=None, model=None):
-        super().__init__(config, dataset, parent_job, model=model)
+    def __init__(
+        self,
+        config,
+        dataset,
+        parent_job=None,
+        initialize_for_forward_only=False,
+        model=None,
+    ):
+        super().__init__(
+            config, dataset, parent_job, initialize_for_forward_only, model
+        )
         self._sampler = KgeSampler.create(config, "negative_sampling", dataset)
-        self.is_prepared = False
         self._implementation = self.config.check(
             "negative_sampling.implementation", ["triple", "all", "batch", "auto"],
         )
@@ -799,9 +859,6 @@ class TrainingJobNegativeSampling(TrainingJob):
     def _prepare(self):
         """Construct dataloader"""
 
-        if self.is_prepared:
-            return
-
         self.num_examples = self.dataset.split(self.train_split).size(0)
         self.loader = torch.utils.data.DataLoader(
             range(self.num_examples),
@@ -812,8 +869,6 @@ class TrainingJobNegativeSampling(TrainingJob):
             worker_init_fn=_generate_worker_init_fn(self.config),
             pin_memory=self.config.get("train.pin_memory"),
         )
-
-        self.is_prepared = True
 
     def _get_collate_fun(self):
         # create the collate function
@@ -1007,7 +1062,8 @@ class TrainingJobNegativeSampling(TrainingJob):
 
                 # backward pass for this chunk
                 backward_time -= time.time()
-                loss_value_torch.backward()
+                if not self.is_forward_only:
+                    loss_value_torch.backward()
                 backward_time += time.time()
 
         # all done
@@ -1019,9 +1075,17 @@ class TrainingJobNegativeSampling(TrainingJob):
 class TrainingJob1vsAll(TrainingJob):
     """Samples SPO pairs and queries sp_ and _po, treating all other entities as negative."""
 
-    def __init__(self, config, dataset, parent_job=None, model=None):
-        super().__init__(config, dataset, parent_job, model=model)
-        self.is_prepared = False
+    def __init__(
+        self,
+        config,
+        dataset,
+        parent_job=None,
+        initialize_for_forward_only=False,
+        model=None,
+    ):
+        super().__init__(
+            config, dataset, parent_job, initialize_for_forward_only, model
+        )
         config.log("Initializing spo training job...")
         self.type_str = "1vsAll"
 
@@ -1031,9 +1095,6 @@ class TrainingJob1vsAll(TrainingJob):
 
     def _prepare(self):
         """Construct dataloader"""
-
-        if self.is_prepared:
-            return
 
         self.num_examples = self.dataset.split(self.train_split).size(0)
         self.loader = torch.utils.data.DataLoader(
@@ -1047,8 +1108,6 @@ class TrainingJob1vsAll(TrainingJob):
             worker_init_fn=_generate_worker_init_fn(self.config),
             pin_memory=self.config.get("train.pin_memory"),
         )
-
-        self.is_prepared = True
 
     def _process_batch(self, batch_index, batch) -> TrainingJob._ProcessBatchResult:
         # prepare
@@ -1064,7 +1123,8 @@ class TrainingJob1vsAll(TrainingJob):
         loss_value = loss_value_sp.item()
         forward_time += time.time()
         backward_time = -time.time()
-        loss_value_sp.backward()
+        if not self.is_forward_only:
+            loss_value_sp.backward()
         backward_time += time.time()
 
         # forward/backward pass (po)
@@ -1074,7 +1134,8 @@ class TrainingJob1vsAll(TrainingJob):
         loss_value += loss_value_po.item()
         forward_time += time.time()
         backward_time -= time.time()
-        loss_value_po.backward()
+        if not self.is_forward_only:
+            loss_value_po.backward()
         backward_time += time.time()
 
         # all done
